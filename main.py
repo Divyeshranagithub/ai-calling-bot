@@ -1,143 +1,141 @@
-import os
-import json
-import base64
 import asyncio
+import base64
+import json
 import websockets
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse
-from fastapi.websockets import WebSocketDisconnect
-from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
-from dotenv import load_dotenv
-import uvicorn
-
-load_dotenv()
-
-# Configuration
-GROQ_API_KEY = "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"  # requires Groq API Access
-
-SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate.")
-VOICE = 'alloy'
-LOG_EVENT_TYPES = [
-    'response.content.done', 'rate_limits.updated', 'response.done',
-    'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped',
-    'input_audio_buffer.speech_started', 'session.created'
-]
+import ssl
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict, Any
 
 app = FastAPI()
-if not GROQ_API_KEY:
-    raise ValueError(
-        'Missing the Groq API key. Please set it in the .env file.')
 
+class DeepgramSTSHandler:
+    def __init__(self, deepgram_api_key: str):
+        self.deepgram_api_key = deepgram_api_key
+        self.audio_queue = asyncio.Queue()
+        self.streamsid_queue = asyncio.Queue()
 
-@app.api_route("/", methods=["GET", "POST"])
-async def index_page():
-    return "<h1>Server is up and running. Groq-LLaMA integration active!</h1>"
+    async def connect_sts(self) -> websockets.WebSocketClientProtocol:
+        """Establish connection to Deepgram STS WebSocket"""
+        extra_headers = {"Authorization": f"Token {self.deepgram_api_key}"}
+        return await websockets.connect(
+            "wss://sts.sandbox.deepgram.com/agent",
+            extra_headers=extra_headers
+        )
 
-
-@app.api_route("/incoming-call", methods=["GET", "POST"])
-async def handle_incoming_call(request: Request):
-    """Handle incoming call and return TwiML response to connect to Media Stream."""
-    response = VoiceResponse()
-    response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and Groq AI."
-    )
-    response.pause(length=1)
-    response.say("O.K. you can start talking!")
-    host = request.url.hostname
-    connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
-    response.append(connect)
-    return HTMLResponse(content=str(response), media_type="application/xml")
-
-
-@app.websocket("/media-stream")
-async def handle_media_stream(websocket: WebSocket):
-    """Handle WebSocket connections between Twilio and Groq API."""
-    print("Client connected")
-    await websocket.accept()
-
-    async with websockets.connect(
-            'wss://api.groq.com/v1/llama2-70b',
-            extra_headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}"
-            }) as groq_ws:
-        await send_session_update(groq_ws)
-        stream_sid = None
-
-        async def receive_from_twilio():
-            """Receive audio data from Twilio and send it to the Groq API."""
-            nonlocal stream_sid
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    if data['event'] == 'media' and groq_ws.open:
-                        audio_append = {
-                            "type": "input_audio",
-                            "audio": data['media']['payload']
-                        }
-                        await groq_ws.send(json.dumps(audio_append))
-                    elif data['event'] == 'start':
-                        stream_sid = data['start']['streamSid']
-                        print(f"Incoming stream has started {stream_sid}")
-            except WebSocketDisconnect:
-                print("Client disconnected.")
-                if groq_ws.open:
-                    await groq_ws.close()
-
-        async def send_to_twilio():
-            """Receive events from the Groq API, send audio back to Twilio."""
-            nonlocal stream_sid
-            try:
-                async for groq_message in groq_ws:
-                    response = json.loads(groq_message)
-                    if response['type'] in LOG_EVENT_TYPES:
-                        print(f"Received event: {response['type']}", response)
-                    if response['type'] == 'session.updated':
-                        print("Session updated successfully:", response)
-                    if response[
-                            'type'] == 'response.audio' and response.get(
-                                'audio_delta'):
-                        # Audio from Groq
-                        try:
-                            audio_payload = base64.b64encode(
-                                base64.b64decode(
-                                    response['audio_delta'])).decode('utf-8')
-                            audio_delta = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {
-                                    "payload": audio_payload
-                                }
-                            }
-                            await websocket.send_json(audio_delta)
-                        except Exception as e:
-                            print(f"Error processing audio data: {e}")
-            except Exception as e:
-                print(f"Error in send_to_twilio: {e}")
-
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
-
-
-async def send_session_update(groq_ws):
-    """Send session update to Groq WebSocket."""
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "voice": VOICE,
-            "instructions": SYSTEM_MESSAGE,
-            "modalities": ["text", "audio"],
-            "temperature": 0.8,
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
+    async def send_sts_configuration(self, sts_ws: websockets.WebSocketClientProtocol):
+        """Send initial configuration to STS"""
+        config_message = {
+            "type": "SettingsConfiguration",
+            "audio": {
+                "input": {
+                    "encoding": "mulaw",
+                    "sample_rate": 8000,
+                },
+                "output": {
+                    "encoding": "mulaw",
+                    "sample_rate": 8000,
+                    "container": "none",
+                },
+            },
+            "agent": {
+                "listen": {"model": "nova-2"},
+                "think": {
+                    "provider": {
+                        "type": "anthropic",
+                    },
+                    "model": "claude-3-haiku-20240307",
+                    "instructions": "You are a helpful car seller.",
+                },
+                "speak": {"model": "aura-asteria-en"},
+            },
         }
-    }
-    print('Sending session update:', json.dumps(session_update))
-    await groq_ws.send(json.dumps(session_update))
+        await sts_ws.send(json.dumps(config_message))
+
+    async def sts_sender(self, sts_ws: websockets.WebSocketClientProtocol):
+        """Send audio chunks from queue to STS"""
+        while True:
+            chunk = await self.audio_queue.get()
+            await sts_ws.send(chunk)
+
+    async def sts_receiver(self, sts_ws: websockets.WebSocketClientProtocol, twilio_ws: WebSocket):
+        """Receive messages from STS and handle them"""
+        streamsid = await self.streamsid_queue.get()
+
+        async for message in sts_ws:
+            if isinstance(message, str):
+                # Handle text messages (like barge-in events)
+                decoded = json.loads(message)
+                if decoded['type'] == 'UserStartedSpeaking':
+                    await twilio_ws.send_json({
+                        "event": "clear",
+                        "streamSid": streamsid
+                    })
+                continue
+
+            # Send TTS audio back to Twilio
+            raw_mulaw = message
+            await twilio_ws.send_json({
+                "event": "media",
+                "streamSid": streamsid,
+                "media": {"payload": base64.b64encode(raw_mulaw).decode("ascii")}
+            })
+
+    async def twilio_receiver(self, twilio_ws: WebSocket):
+        """Receive and process Twilio WebSocket messages"""
+        BUFFER_SIZE = 20 * 160
+        inbuffer = bytearray(b"")
+
+        try:
+            while True:
+                data = await twilio_ws.receive_json()
+
+                if data["event"] == "start":
+                    streamsid = data["start"]["streamSid"]
+                    await self.streamsid_queue.put(streamsid)
+
+                if data["event"] == "media":
+                    media = data["media"]
+                    chunk = base64.b64decode(media["payload"])
+                    if media["track"] == "inbound":
+                        inbuffer.extend(chunk)
+
+                # Process buffer in chunks
+                while len(inbuffer) >= BUFFER_SIZE:
+                    chunk = inbuffer[:BUFFER_SIZE]
+                    await self.audio_queue.put(chunk)
+                    inbuffer = inbuffer[BUFFER_SIZE:]
+
+                if data["event"] == "stop":
+                    break
+
+        except WebSocketDisconnect:
+            # Handle WebSocket disconnection
+            pass
+
+    async def handle_twilio_connection(self, twilio_ws: WebSocket):
+        """Main handler for Twilio WebSocket connection"""
+        await twilio_ws.accept()
+
+        async with await self.connect_sts() as sts_ws:
+            await self.send_sts_configuration(sts_ws)
+
+            # Run concurrent tasks
+            await asyncio.gather(
+                self.sts_sender(sts_ws),
+                self.sts_receiver(sts_ws, twilio_ws),
+                self.twilio_receiver(twilio_ws)
+            )
+
+@app.websocket("/twilio")
+async def twilio_websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for Twilio connections"""
+    deepgram_api_key = "b749e403c7141d930ad7cd1e7b7f5d4a96e114b5"  # Replace with actual key
+    handler = DeepgramSTSHandler(deepgram_api_key)
+    await handler.handle_twilio_connection(websocket)
 
 
+# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0")
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
