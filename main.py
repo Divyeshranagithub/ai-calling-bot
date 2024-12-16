@@ -3,8 +3,10 @@ import base64
 import json
 import websockets
 import ssl
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse
 from typing import Dict, Any
+from twilio.twiml.voice_response import VoiceResponse, Connect
 
 app = FastAPI()
 
@@ -126,13 +128,28 @@ class DeepgramSTSHandler:
                 self.twilio_receiver(twilio_ws)
             )
 
-@app.websocket("/twilio")
+@app.websocket("/media-stream")
 async def twilio_websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for Twilio connections"""
     deepgram_api_key = "b749e403c7141d930ad7cd1e7b7f5d4a96e114b5"  # Replace with actual key
     handler = DeepgramSTSHandler(deepgram_api_key)
     await handler.handle_twilio_connection(websocket)
 
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    """Handle incoming call and return TwiML response to connect to Media Stream."""
+    response = VoiceResponse()
+    # <Say> punctuation to improve text-to-speech flow
+    response.say(
+        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API"
+    )
+    response.pause(length=1)
+    response.say("O.K. you can start talking!")
+    host = request.url.hostname
+    connect = Connect()
+    connect.stream(url=f'wss://{host}/media-stream')
+    response.append(connect)
+    return HTMLResponse(content=str(response), media_type="application/xml")
 
 # Run with: uvicorn main:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
