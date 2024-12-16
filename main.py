@@ -48,7 +48,7 @@ class DeepgramSTSHandler:
             sts_ws = await asyncio.wait_for(
                 websockets.connect(
                     "wss://sts.sandbox.deepgram.com/agent",
-                    header=headers,
+                    headers=headers,
                     ssl=ssl_context
                 ),
                 timeout=connection_timeout
