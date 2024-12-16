@@ -141,7 +141,7 @@ async def handle_incoming_call(request: Request):
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
     response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by &.ai."
+        "Please wait while we connect your call to the A. I. voice assistant, powered by and.ai."
     )
     response.pause(length=1)
     response.say("O.K. you can start talking!")
